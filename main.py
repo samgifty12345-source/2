@@ -269,6 +269,7 @@ def download(url, is_youtube=False):
     tmp.mkdir(exist_ok=True)
     opts = {"quiet": True, "no_warnings": True, "format": "best[ext=mp4]/best",
             "outtmpl": str(tmp / "%(id)s.%(ext)s")}
+    attempts = [{}]
     if is_youtube:
         if shutil.which("ffmpeg"):
             opts["format"] = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
@@ -276,14 +277,30 @@ def download(url, is_youtube=False):
         ck = cookie_file()
         if ck:
             opts["cookiefile"] = ck
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = Path(ydl.prepare_filename(info))
-        if not path.exists():  # merged files can end up as .mp4
-            alt = path.with_suffix(".mp4")
-            if alt.exists():
-                path = alt
-        return path, info
+        # YouTube hides video links behind a JavaScript puzzle; yt-dlp needs deno/node to solve it.
+        runtimes = {n: {} for n in ("deno", "node", "bun") if shutil.which(n)}
+        if runtimes:
+            opts["js_runtimes"] = runtimes
+        opts["remote_components"] = ["ejs:github"]
+        attempts.append({"extractor_args": {"youtube": {"player_client": ["tv", "web_safari", "mweb"]}}})
+    last = None
+    for i, extra in enumerate(attempts):
+        try:
+            with yt_dlp.YoutubeDL({**opts, **extra}) as ydl:
+                info = ydl.extract_info(url, download=True)
+                path = Path(ydl.prepare_filename(info))
+                if not path.exists():  # merged files can end up as .mp4
+                    alt = path.with_suffix(".mp4")
+                    if alt.exists():
+                        path = alt
+                return path, info
+        except Exception as e:
+            last = e
+            if is_youtube and i < len(attempts) - 1 and "format is not available" in str(e).lower():
+                log("YouTube gave no downloadable formats, retrying with other client types...")
+                continue
+            raise
+    raise last
 
 
 def host_video(path):
@@ -613,6 +630,7 @@ if __name__ == "__main__":
         STATE["next"] = time.time() + 60
     threading.Thread(target=scheduler, daemon=True).start()
     port = int(os.getenv("PORT", "8080"))
+    log("Tools on server: " + ", ".join(f"{n}={'yes' if shutil.which(n) else 'NO'}" for n in ("ffmpeg", "deno", "node")))
     try:
         import yt_dlp
         log(f"yt-dlp version {yt_dlp.version.__version__}")
