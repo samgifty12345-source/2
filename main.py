@@ -40,7 +40,7 @@ DEFAULTS = {
     "source": "tiktok",       # tiktok | youtube | both
     "handle": "",             # TikTok handle
     "yt_channel": "",         # old YouTube channel: @handle, channel URL or UC... id
-    "yt_content": "streams",  # streams (VODs) | videos (uploads) | both
+    "yt_content": "streams",  # shorts | streams (VODs) | videos (uploads) | both | all
     "order": "oldest",        # newest | oldest | random
     "privacy": "private",
     "limit": 5,
@@ -48,7 +48,7 @@ DEFAULTS = {
     "interval": 24,
 }
 SOURCES = ("tiktok", "youtube", "both")
-YT_CONTENT = ("streams", "videos", "both")
+YT_CONTENT = ("shorts", "streams", "videos", "both", "all")
 ORDERS = ("newest", "oldest", "random")
 PRIVACY = ("private", "unlisted", "public")
 
@@ -196,7 +196,7 @@ def list_youtube(channel, content):
     """Returns entries newest first. 'streams' = past livestreams (VODs)."""
     import yt_dlp
     base = channel_base(channel)
-    tabs = ["streams", "videos"] if content == "both" else [content]
+    tabs = {"both": ["streams", "videos"], "all": ["streams", "videos", "shorts"]}.get(content, [content])
     urls = [f"{base}/{t}" for t in tabs]
     m = re.search(r"/channel/(UC[\w-]{22})", base)
     if m:  # uploads playlist: includes past streams, sometimes works when the tabs do not
@@ -496,9 +496,11 @@ def dashboard():
                                               "both": "Both (mixed)"}),
         "HANDLE": html.escape(s["handle"], quote=True),
         "YTCHAN": html.escape(s["yt_channel"], quote=True),
-        "YTCONT": options(YT_CONTENT, s["yt_content"], {"streams": "VODs (past livestreams)",
+        "YTCONT": options(YT_CONTENT, s["yt_content"], {"shorts": "Shorts",
+                                                        "streams": "VODs (past livestreams)",
                                                         "videos": "Regular uploads",
-                                                        "both": "VODs + uploads"}),
+                                                        "both": "VODs + uploads",
+                                                        "all": "Everything (VODs, uploads, Shorts)"}),
         "ORDER": options(ORDERS, s["order"], {"newest": "Latest first", "oldest": "Oldest first",
                                               "random": "Random"}),
         "PRIV": options(PRIVACY, s["privacy"]), "LIMIT": str(s["limit"]),
