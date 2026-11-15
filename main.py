@@ -1,10 +1,15 @@
 """
-TikTok -> YouTube dashboard (uses the Zernio API). Single file, runs on Railway.
+TikTok / old YouTube channel -> new YouTube channel dashboard (uses the Zernio API).
+Single file, runs on Railway.
 
 Railway variables needed:
   ZERNIO_API_KEY   your Zernio API key
   ADMIN_PASSWORD   password to open the dashboard (any username works)
-Optional: a Volume mounted at /data so settings + history survive redeploys.
+Optional:
+  YT_COOKIES       contents of a cookies.txt (Netscape format) from a logged-in YouTube
+                   session. Helps when YouTube blocks downloads from Railway's servers.
+  A Volume mounted at /data so settings + history survive redeploys.
+  ffmpeg installed on the server for full-quality YouTube downloads (see notes).
 """
 
 import base64
@@ -12,10 +17,11 @@ import hmac
 import html
 import json
 import os
+import random
+import shutil
 import tempfile
 import threading
 import time
-import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,7 +33,21 @@ API = "https://zernio.com/api/v1"
 DATA = Path("/data") if Path("/data").is_dir() else Path(__file__).parent / "data"
 DATA.mkdir(parents=True, exist_ok=True)
 SETTINGS_F, HISTORY_F = DATA / "settings.json", DATA / "history.json"
-DEFAULTS = {"handle": "", "privacy": "private", "limit": 5, "auto": False, "interval": 24}
+DEFAULTS = {
+    "source": "tiktok",       # tiktok | youtube | both
+    "handle": "",             # TikTok handle
+    "yt_channel": "",         # old YouTube channel: @handle, channel URL or UC... id
+    "yt_content": "streams",  # streams (VODs) | videos (uploads) | both
+    "order": "oldest",        # newest | oldest | random
+    "privacy": "private",
+    "limit": 5,
+    "auto": False,
+    "interval": 24,
+}
+SOURCES = ("tiktok", "youtube", "both")
+YT_CONTENT = ("streams", "videos", "both")
+ORDERS = ("newest", "oldest", "random")
+PRIVACY = ("private", "unlisted", "public")
 
 LOG = deque(maxlen=300)
 STATE = {"running": False, "last": None, "next": None}
@@ -83,29 +103,109 @@ def find_youtube(cached=False):
     return acct
 
 
-# ---------- Job ----------
+# ---------- Sources ----------
+def cookie_file():
+    """Write YT_COOKIES (if set) to a temp file for yt-dlp."""
+    data = os.getenv("YT_COOKIES")
+    if not data:
+        return None
+    p = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+    p.write_text(data)
+    return str(p)
+
+
 def list_tiktoks(handle):
+    """Returns entries newest first (the order TikTok lists them)."""
     import yt_dlp
     opts = {"quiet": True, "extract_flat": True, "ignoreerrors": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.tiktok.com/@{handle}", download=False)
-    return list(reversed([e for e in (info or {}).get("entries", []) if e]))  # oldest first
+    return [e for e in (info or {}).get("entries", []) if e]
 
 
-def download(url):
+def channel_base(channel):
+    """Turn '@name', 'name', a UC... id or a channel URL into a clean channel URL."""
+    c = channel.strip()
+    if c.startswith("http"):
+        for tail in ("/videos", "/streams", "/shorts", "/featured", "/live"):
+            if c.rstrip("/").endswith(tail):
+                c = c.rstrip("/")[: -len(tail)]
+        return c.rstrip("/")
+    if c.startswith("UC") and len(c) > 20:
+        return f"https://www.youtube.com/channel/{c}"
+    return f"https://www.youtube.com/@{c.lstrip('@')}"
+
+
+def list_youtube(channel, content):
+    """Returns entries newest first. 'streams' = past livestreams (VODs)."""
+    import yt_dlp
+    base = channel_base(channel)
+    tabs = ["streams", "videos"] if content == "both" else [content]
+    seen, out = set(), []
+    opts = {"quiet": True, "extract_flat": True, "ignoreerrors": True}
+    ck = cookie_file()
+    if ck:
+        opts["cookiefile"] = ck
+    for tab in tabs:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"{base}/{tab}", download=False)
+        for e in (info or {}).get("entries", []) or []:
+            if not e or not e.get("id") or e["id"] in seen:
+                continue
+            if e.get("live_status") in ("is_live", "is_upcoming"):
+                continue  # skip streams that haven't finished
+            seen.add(e["id"])
+            e.setdefault("url", f"https://www.youtube.com/watch?v={e['id']}")
+            out.append(e)
+    return out
+
+
+def apply_order(entries, order):
+    """entries come newest first."""
+    entries = list(entries)
+    if order == "oldest":
+        entries.reverse()
+    elif order == "random":
+        random.shuffle(entries)
+    return entries
+
+
+def interleave(a, b):
+    out = []
+    for i in range(max(len(a), len(b))):
+        if i < len(a):
+            out.append(a[i])
+        if i < len(b):
+            out.append(b[i])
+    return out
+
+
+def download(url, is_youtube=False):
     import yt_dlp
     tmp = Path(tempfile.gettempdir()) / "tt"
     tmp.mkdir(exist_ok=True)
     opts = {"quiet": True, "format": "best[ext=mp4]/best", "outtmpl": str(tmp / "%(id)s.%(ext)s")}
+    if is_youtube:
+        if shutil.which("ffmpeg"):
+            opts["format"] = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+            opts["merge_output_format"] = "mp4"
+        ck = cookie_file()
+        if ck:
+            opts["cookiefile"] = ck
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return Path(ydl.prepare_filename(info)), info
+        path = Path(ydl.prepare_filename(info))
+        if not path.exists():  # merged files can end up as .mp4
+            alt = path.with_suffix(".mp4")
+            if alt.exists():
+                path = alt
+        return path, info
 
 
 def host_video(path):
     p = api("POST", "/media/presign", json={"filename": path.name, "contentType": "video/mp4"})
     with path.open("rb") as f:
-        requests.put(p["uploadUrl"], data=f, headers={"Content-Type": "video/mp4"}, timeout=900).raise_for_status()
+        requests.put(p["uploadUrl"], data=f, headers={"Content-Type": "video/mp4"}, timeout=3600).raise_for_status()
     return p["publicUrl"]
 
 
@@ -114,7 +214,7 @@ def post_youtube(account_id, media_url, title, desc, privacy):
         "content": desc[:4900],
         "mediaItems": [{"type": "video", "url": media_url}],
         "platforms": [{"platform": "youtube", "accountId": account_id, "platformSpecificData": {
-            "title": (title.strip() or "My TikTok")[:100], "visibility": privacy,
+            "title": (title.strip() or "My video")[:100], "visibility": privacy,
             "categoryId": "22", "madeForKids": False}}],
         "publishNow": True,
     }
@@ -123,6 +223,7 @@ def post_youtube(account_id, media_url, title, desc, privacy):
     return plat.get("platformPostUrl") or "queued on Zernio"
 
 
+# ---------- Job ----------
 def run_job():
     if not JOB_LOCK.acquire(blocking=False):
         return
@@ -134,20 +235,46 @@ def run_job():
         if not acct:
             log("YouTube is not connected. Click 'Connect YouTube' first.")
             return
-        handle = s["handle"].strip().lstrip("@")
-        if not handle:
-            log("Enter your TikTok handle in settings first.")
-            return
+
         history = load_history()
         done = {h["id"] for h in history}
-        entries = [e for e in list_tiktoks(handle) if e.get("id") not in done]
-        log(f"Found {len(entries)} new TikTok(s) for @{handle}. Posting up to {s['limit']}.")
+        use_tt = s["source"] in ("tiktok", "both")
+        use_yt = s["source"] in ("youtube", "both")
+
+        handle = s["handle"].strip().lstrip("@")
+        if use_tt and not handle:
+            log("Enter your TikTok handle in settings first.")
+            return
+        if use_yt and not s["yt_channel"].strip():
+            log("Enter the old YouTube channel in settings first.")
+            return
+
+        tt, yt = [], []
+        if use_tt:
+            tt = [dict(e, _src="tiktok") for e in list_tiktoks(handle) if e.get("id") not in done]
+            log(f"Found {len(tt)} new TikTok(s) for @{handle}.")
+        if use_yt:
+            yt = [dict(e, _src="youtube") for e in list_youtube(s["yt_channel"], s["yt_content"])
+                  if e.get("id") not in done]
+            log(f"Found {len(yt)} new video(s) on the old YouTube channel ({s['yt_content']}).")
+
+        if use_tt and use_yt:
+            if s["order"] == "random":
+                entries = apply_order(tt + yt, "random")
+            else:
+                entries = interleave(apply_order(tt, s["order"]), apply_order(yt, s["order"]))
+        else:
+            entries = apply_order(tt or yt, s["order"])
+
+        log(f"Posting up to {s['limit']} ({s['order']} first).")
         for entry in entries[: int(s["limit"])]:
             url = entry.get("url") or entry.get("webpage_url")
             try:
-                path, info = download(url)
+                is_yt = entry["_src"] == "youtube"
+                path, info = download(url, is_youtube=is_yt)
                 desc = info.get("description") or info.get("title") or ""
-                link = post_youtube(acct, host_video(path), desc.split("\n")[0], desc, s["privacy"])
+                title = (info.get("title") or "") if is_yt else desc.split("\n")[0]
+                link = post_youtube(acct, host_video(path), title, desc, s["privacy"])
                 history.append({"id": entry["id"], "url": link, "time": time.strftime("%Y-%m-%d %H:%M")})
                 HISTORY_F.write_text(json.dumps(history))
                 path.unlink(missing_ok=True)
@@ -174,7 +301,7 @@ def scheduler():
 
 # ---------- Web ----------
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>TikTok to YouTube</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Video Reposter</title>
 <style>
 :root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1a1c20;--mut:#6b7280;--bd:#e3e5ea;--ac:#e11d48}
 @media(prefers-color-scheme:dark){:root{--bg:#111316;--card:#1b1e23;--fg:#e8eaed;--mut:#9aa0a8;--bd:#2c3037}}
@@ -190,12 +317,17 @@ button.sec{background:transparent;color:var(--fg);border:1px solid var(--bd)}
 pre{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px;height:220px;overflow:auto;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
 a{color:var(--ac)}.mut{color:var(--mut);font-size:13px}.chk{display:flex;align-items:center;gap:8px;margin-top:12px}.chk input{width:auto}
 </style></head><body><main>
-<h1>TikTok to YouTube</h1>
+<h1>Video Reposter</h1>
 %%WARN%%
-<div class="card"><b>YouTube</b><br><span class="dot" style="background:%%YTCOLOR%%"></span>%%YTTEXT%%
+<div class="card"><b>New YouTube channel (where videos get posted)</b><br><span class="dot" style="background:%%YTCOLOR%%"></span>%%YTTEXT%%
 <div style="margin-top:10px">%%YTBTN%%</div></div>
 <form class="card" method="post" action="/save"><b>Settings</b>
-<label>TikTok handle (no @)</label><input name="handle" value="%%HANDLE%%" placeholder="yourname">
+<label>Take videos from</label><select name="source" id="source">%%SRC%%</select>
+<div id="tt-box"><label>TikTok handle (no @)</label><input name="handle" value="%%HANDLE%%" placeholder="yourname"></div>
+<div id="yt-box"><label>Old YouTube channel (@handle, channel link or UC... id)</label>
+<input name="yt_channel" value="%%YTCHAN%%" placeholder="@oldchannel">
+<label>What to take from it</label><select name="yt_content">%%YTCONT%%</select></div>
+<label>Post order</label><select name="order">%%ORDER%%</select>
 <div class="row"><div><label>Privacy on YouTube</label><select name="privacy">%%PRIV%%</select></div>
 <div><label>Videos per run</label><input name="limit" type="number" min="1" max="30" value="%%LIMIT%%"></div></div>
 <div class="chk"><input type="checkbox" name="auto" id="auto" %%AUTO%%><label for="auto" style="margin:0;color:var(--fg)">Run automatically every</label>
@@ -206,9 +338,13 @@ a{color:var(--ac)}.mut{color:var(--mut);font-size:13px}.chk{display:flex;align-i
 <form method="post" action="/run" style="margin:10px 0 0"><button type="submit">Run now</button></form>
 <pre id="log">%%LOG%%</pre></div>
 <div class="card"><b>Posted (%%COUNT%%)</b><div class="mut" style="margin-top:6px">%%HIST%%</div>
-<form method="post" action="/reset" onsubmit="return confirm('Forget what was posted? Old TikToks may be posted again.')" style="margin-top:10px">
+<form method="post" action="/reset" onsubmit="return confirm('Forget what was posted? Old videos may be posted again.')" style="margin-top:10px">
 <button class="sec" type="submit">Reset history</button></form></div>
 </main><script>
+function vis(){const v=document.getElementById('source').value;
+document.getElementById('tt-box').style.display=(v==='youtube')?'none':'block';
+document.getElementById('yt-box').style.display=(v==='tiktok')?'none':'block'}
+document.getElementById('source').addEventListener('change',vis);vis();
 async function t(){try{const r=await fetch('/log');const d=await r.json();
 const l=document.getElementById('log');const b=l.scrollTop+l.clientHeight>=l.scrollHeight-20;
 l.textContent=d.log;if(b)l.scrollTop=l.scrollHeight;document.getElementById('st').textContent=d.status}catch(e){}}
@@ -226,6 +362,13 @@ def status_text():
     return " · ".join(parts)
 
 
+def options(choices, current, labels=None):
+    labels = labels or {}
+    return "".join(
+        f'<option value="{c}"{" selected" if current == c else ""}>{html.escape(labels.get(c, c))}</option>'
+        for c in choices)
+
+
 def dashboard():
     s = load_settings()
     warn, yt_ok, yt_text = "", False, "Checking failed"
@@ -240,12 +383,21 @@ def dashboard():
         f'{html.escape(h["time"])} · <a href="{html.escape(h["url"])}" target="_blank">{html.escape(h["url"])}</a>'
         if str(h["url"]).startswith("http") else f'{html.escape(h["time"])} · {html.escape(str(h["url"]))}'
         for h in reversed(hist[-15:])) or "Nothing yet."
-    priv = "".join(f'<option value="{p}"{" selected" if s["privacy"] == p else ""}>{p}</option>'
-                   for p in ("private", "unlisted", "public"))
-    rep = {"WARN": warn, "YTCOLOR": "#16a34a" if yt_ok else "#dc2626", "YTTEXT": yt_text, "YTBTN": btn,
-           "HANDLE": html.escape(s["handle"], quote=True), "PRIV": priv, "LIMIT": str(s["limit"]),
-           "AUTO": "checked" if s["auto"] else "", "INT": str(s["interval"]), "STATUS": html.escape(status_text()),
-           "LOG": html.escape("\n".join(LOG)), "COUNT": str(len(hist)), "HIST": h_html}
+    rep = {
+        "WARN": warn, "YTCOLOR": "#16a34a" if yt_ok else "#dc2626", "YTTEXT": yt_text, "YTBTN": btn,
+        "SRC": options(SOURCES, s["source"], {"tiktok": "TikTok", "youtube": "Old YouTube channel",
+                                              "both": "Both (mixed)"}),
+        "HANDLE": html.escape(s["handle"], quote=True),
+        "YTCHAN": html.escape(s["yt_channel"], quote=True),
+        "YTCONT": options(YT_CONTENT, s["yt_content"], {"streams": "VODs (past livestreams)",
+                                                        "videos": "Regular uploads",
+                                                        "both": "VODs + uploads"}),
+        "ORDER": options(ORDERS, s["order"], {"newest": "Latest first", "oldest": "Oldest first",
+                                              "random": "Random"}),
+        "PRIV": options(PRIVACY, s["privacy"]), "LIMIT": str(s["limit"]),
+        "AUTO": "checked" if s["auto"] else "", "INT": str(s["interval"]), "STATUS": html.escape(status_text()),
+        "LOG": html.escape("\n".join(LOG)), "COUNT": str(len(hist)), "HIST": h_html,
+    }
     out = PAGE
     for k, v in rep.items():
         out = out.replace(f"%%{k}%%", v)
@@ -282,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
                     return True
             except Exception:
                 pass
-        self.send(401, "Password required", headers={"WWW-Authenticate": 'Basic realm="TikTok to YouTube"'})
+        self.send(401, "Password required", headers={"WWW-Authenticate": 'Basic realm="Video Reposter"'})
         return False
 
     def do_GET(self):
@@ -317,8 +469,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/save":
             s = load_settings()
+            s["source"] = form.get("source") if form.get("source") in SOURCES else "tiktok"
             s["handle"] = form.get("handle", "").strip().lstrip("@")[:60]
-            s["privacy"] = form.get("privacy") if form.get("privacy") in ("private", "unlisted", "public") else "private"
+            s["yt_channel"] = form.get("yt_channel", "").strip()[:200]
+            s["yt_content"] = form.get("yt_content") if form.get("yt_content") in YT_CONTENT else "streams"
+            s["order"] = form.get("order") if form.get("order") in ORDERS else "oldest"
+            s["privacy"] = form.get("privacy") if form.get("privacy") in PRIVACY else "private"
             s["limit"] = max(1, min(30, int(form.get("limit") or 5)))
             s["interval"] = max(1, min(168, int(form.get("interval") or 24)))
             s["auto"] = "auto" in form
