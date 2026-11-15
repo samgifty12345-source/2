@@ -263,6 +263,23 @@ def interleave(a, b):
     return out
 
 
+def describe_formats(url, base_opts):
+    """Log which formats YouTube actually offered (diagnostic for 'format not available')."""
+    import yt_dlp
+    try:
+        o = {k: v for k, v in base_opts.items() if k not in ("format", "format_sort", "merge_output_format")}
+        o.update(ignore_no_formats_error=True, skip_download=True)
+        with yt_dlp.YoutubeDL(o) as ydl:
+            info = ydl.extract_info(url, download=False, process=False)
+        fm = (info or {}).get("formats") or []
+        real = [f for f in fm if f.get("vcodec") != "none" or f.get("acodec") not in (None, "none")]
+        log(f"YouTube offered {len(fm)} format(s), {len(real)} playable. "
+            + "; ".join(f"{f.get('format_id')} {f.get('ext')} {f.get('height') or ''}p "
+                        f"v={f.get('vcodec')} a={f.get('acodec')}" for f in real[:8]))
+    except Exception as e:
+        log(f"Could not list formats: {clean_err(e)}")
+
+
 def download(url, is_youtube=False):
     import yt_dlp
     tmp = Path(tempfile.gettempdir()) / "tt"
@@ -271,18 +288,23 @@ def download(url, is_youtube=False):
             "outtmpl": str(tmp / "%(id)s.%(ext)s")}
     attempts = [{}]
     if is_youtube:
+        # Loose format request: take the best video + audio, then make an mp4 (needs ffmpeg).
         if shutil.which("ffmpeg"):
-            opts["format"] = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+            opts["format"] = "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+            opts["format_sort"] = ["vcodec:h264", "lang", "quality", "res", "fps", "hdr:12", "acodec:aac"]
             opts["merge_output_format"] = "mp4"
-        ck = cookie_file()
-        if ck:
-            opts["cookiefile"] = ck
-        # YouTube hides video links behind a JavaScript puzzle; yt-dlp needs deno/node to solve it.
+        else:
+            opts["format"] = "b/best"
         runtimes = {n: {} for n in ("deno", "node", "bun") if shutil.which(n)}
         if runtimes:
             opts["js_runtimes"] = runtimes
-        opts["remote_components"] = ["ejs:github"]
-        attempts.append({"extractor_args": {"youtube": {"player_client": ["tv", "web_safari", "mweb"]}}})
+        ck = cookie_file()
+        if ck:
+            opts["cookiefile"] = ck
+            # Stale cookies can make YouTube hand out nothing: retry without them (public videos).
+            attempts.append({"cookiefile": None})
+        attempts.append({"cookiefile": None,
+                         "extractor_args": {"youtube": {"player_client": ["tv", "web_safari", "mweb"]}}})
     last = None
     for i, extra in enumerate(attempts):
         try:
@@ -296,9 +318,12 @@ def download(url, is_youtube=False):
                 return path, info
         except Exception as e:
             last = e
-            if is_youtube and i < len(attempts) - 1 and "format is not available" in str(e).lower():
-                log("YouTube gave no downloadable formats, retrying with other client types...")
-                continue
+            if is_youtube and "format is not available" in str(e).lower():
+                if i == 0:
+                    describe_formats(url, {**opts, **extra})
+                if i < len(attempts) - 1:
+                    log("No usable formats, retrying a different way...")
+                    continue
             raise
     raise last
 
