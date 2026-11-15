@@ -227,9 +227,16 @@ def list_youtube(channel, content):
         auth = [m for m in errors if is_auth_error(m)]
         if auth:
             raise NeedSignIn(auth[0])
-        real = [m for m in errors if "does not have" not in m.lower()]
-        if real:
-            raise RuntimeError(f"Could not read the old channel ({base}): {real[0]}")
+        notab = [m for m in errors if "does not have" in m.lower()]
+        if len(notab) == len(errors):
+            # YouTube shows no video tabs: channel hidden from logged-out visitors, or bot-blocked.
+            if not cookie_file():
+                raise NeedSignIn(notab[0] + " (the channel may be hidden unless you are signed in)")
+            raise RuntimeError(
+                f"Even with your cookies YouTube shows no video tabs for {base}. Check the name is right, "
+                "that the channel opens with videos while signed in, and that the cookies are fresh "
+                "and come from an account that can see it.")
+        raise RuntimeError(f"Could not read the old channel ({base}): {errors[0]}")
     return out
 
 
