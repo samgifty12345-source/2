@@ -6,10 +6,12 @@ Railway variables needed:
   ZERNIO_API_KEY   your Zernio API key
   ADMIN_PASSWORD   password to open the dashboard (any username works)
 Optional:
-  YT_COOKIES       contents of a cookies.txt (Netscape format) from a logged-in YouTube
-                   session. Helps when YouTube blocks downloads from Railway's servers.
-  A Volume mounted at /data so settings + history survive redeploys.
-  ffmpeg installed on the server for full-quality YouTube downloads (see notes).
+  A Volume mounted at /data so settings, history and cookies survive redeploys.
+  ffmpeg on the server for full-quality YouTube downloads.
+  YT_COOKIES       cookies.txt contents (only needed if you don't use the dashboard box).
+
+If YouTube blocks the bot, the log says FAILED and the dashboard shows a box where
+you paste your cookies.txt. The bot then retries by itself.
 """
 
 import base64
@@ -18,6 +20,7 @@ import html
 import json
 import os
 import random
+import re
 import shutil
 import tempfile
 import threading
@@ -32,7 +35,7 @@ import requests
 API = "https://zernio.com/api/v1"
 DATA = Path("/data") if Path("/data").is_dir() else Path(__file__).parent / "data"
 DATA.mkdir(parents=True, exist_ok=True)
-SETTINGS_F, HISTORY_F = DATA / "settings.json", DATA / "history.json"
+SETTINGS_F, HISTORY_F, COOKIES_F = DATA / "settings.json", DATA / "history.json", DATA / "cookies.txt"
 DEFAULTS = {
     "source": "tiktok",       # tiktok | youtube | both
     "handle": "",             # TikTok handle
@@ -49,10 +52,17 @@ YT_CONTENT = ("streams", "videos", "both")
 ORDERS = ("newest", "oldest", "random")
 PRIVACY = ("private", "unlisted", "public")
 
+AUTH_HINTS = ("sign in", "confirm you", "not a bot", "cookies", "log in", "login", "age-restricted",
+              "members-only", "private video", "429", "too many requests", "po token")
+
 LOG = deque(maxlen=300)
-STATE = {"running": False, "last": None, "next": None}
+STATE = {"running": False, "last": None, "next": None, "need_cookies": False}
 JOB_LOCK = threading.Lock()
 _yt_cache = {"t": 0, "v": None}
+
+
+class NeedSignIn(Exception):
+    pass
 
 
 def log(msg):
@@ -73,6 +83,58 @@ def load_history():
         return json.loads(HISTORY_F.read_text())
     except Exception:
         return []
+
+
+def clean_err(e):
+    t = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+    t = re.sub(r"^ERROR:\s*", "", t.strip())
+    return " ".join(t.split())[:350]
+
+
+def is_auth_error(msg):
+    m = msg.lower()
+    return any(h in m for h in AUTH_HINTS)
+
+
+def need_signin_message(msg):
+    if COOKIES_F.exists():
+        return ("FAILED: YouTube rejected the saved cookies (they may have expired). "
+                "Export fresh cookies and paste them in the Cookies box. Reason: " + msg)
+    return ("FAILED: YouTube needs you to sign in. Paste your cookies.txt in the Cookies box "
+            "on the dashboard and the bot will retry automatically. Reason: " + msg)
+
+
+# ---------- Cookies ----------
+def cookie_file():
+    """Path to a cookies file for yt-dlp: the dashboard-saved one, else YT_COOKIES env."""
+    if COOKIES_F.exists() and COOKIES_F.stat().st_size > 20:
+        return str(COOKIES_F)
+    data = os.getenv("YT_COOKIES")
+    if data:
+        p = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+        p.write_text(data)
+        return str(p)
+    return None
+
+
+def cookie_status():
+    if not COOKIES_F.exists():
+        return "none saved"
+    lines = [l for l in COOKIES_F.read_text().splitlines() if l.strip() and not l.startswith("#")]
+    return f"saved ({len(lines)} cookies)"
+
+
+def save_cookies(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    good = [l for l in text.splitlines() if l.count("\t") >= 6 and not l.startswith("#")]
+    if not good:
+        log("That does not look like a cookies.txt file (Netscape format). Nothing saved.")
+        return False
+    if not text.startswith("# Netscape HTTP Cookie File") and not text.startswith("# HTTP Cookie File"):
+        text = "# Netscape HTTP Cookie File\n" + text
+    COOKIES_F.write_text(text + "\n")
+    log(f"Cookies saved ({len(good)} cookies).")
+    return True
 
 
 # ---------- Zernio ----------
@@ -104,22 +166,15 @@ def find_youtube(cached=False):
 
 
 # ---------- Sources ----------
-def cookie_file():
-    """Write YT_COOKIES (if set) to a temp file for yt-dlp."""
-    data = os.getenv("YT_COOKIES")
-    if not data:
-        return None
-    p = Path(tempfile.gettempdir()) / "yt_cookies.txt"
-    p.write_text(data)
-    return str(p)
-
-
 def list_tiktoks(handle):
     """Returns entries newest first (the order TikTok lists them)."""
     import yt_dlp
-    opts = {"quiet": True, "extract_flat": True, "ignoreerrors": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.tiktok.com/@{handle}", download=False)
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.tiktok.com/@{handle}", download=False)
+    except Exception as e:
+        raise RuntimeError(f"Could not read TikTok @{handle}: {clean_err(e)}")
     return [e for e in (info or {}).get("entries", []) if e]
 
 
@@ -127,10 +182,11 @@ def channel_base(channel):
     """Turn '@name', 'name', a UC... id or a channel URL into a clean channel URL."""
     c = channel.strip()
     if c.startswith("http"):
+        c = c.rstrip("/")
         for tail in ("/videos", "/streams", "/shorts", "/featured", "/live"):
-            if c.rstrip("/").endswith(tail):
-                c = c.rstrip("/")[: -len(tail)]
-        return c.rstrip("/")
+            if c.endswith(tail):
+                c = c[: -len(tail)]
+        return c
     if c.startswith("UC") and len(c) > 20:
         return f"https://www.youtube.com/channel/{c}"
     return f"https://www.youtube.com/@{c.lstrip('@')}"
@@ -141,14 +197,22 @@ def list_youtube(channel, content):
     import yt_dlp
     base = channel_base(channel)
     tabs = ["streams", "videos"] if content == "both" else [content]
-    seen, out = set(), []
-    opts = {"quiet": True, "extract_flat": True, "ignoreerrors": True}
+    seen, out, errors = set(), [], []
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist"}
     ck = cookie_file()
     if ck:
         opts["cookiefile"] = ck
     for tab in tabs:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"{base}/{tab}", download=False)
+        url = f"{base}/{tab}"
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            msg = clean_err(e)
+            errors.append(msg)
+            log(f"Could not read {url}: {msg}")
+            continue
+        count = 0
         for e in (info or {}).get("entries", []) or []:
             if not e or not e.get("id") or e["id"] in seen:
                 continue
@@ -157,6 +221,15 @@ def list_youtube(channel, content):
             seen.add(e["id"])
             e.setdefault("url", f"https://www.youtube.com/watch?v={e['id']}")
             out.append(e)
+            count += 1
+        log(f"Checked {url}: {count} video(s) listed.")
+    if not out and errors:
+        auth = [m for m in errors if is_auth_error(m)]
+        if auth:
+            raise NeedSignIn(auth[0])
+        real = [m for m in errors if "does not have" not in m.lower()]
+        if real:
+            raise RuntimeError(f"Could not read the old channel ({base}): {real[0]}")
     return out
 
 
@@ -184,7 +257,8 @@ def download(url, is_youtube=False):
     import yt_dlp
     tmp = Path(tempfile.gettempdir()) / "tt"
     tmp.mkdir(exist_ok=True)
-    opts = {"quiet": True, "format": "best[ext=mp4]/best", "outtmpl": str(tmp / "%(id)s.%(ext)s")}
+    opts = {"quiet": True, "no_warnings": True, "format": "best[ext=mp4]/best",
+            "outtmpl": str(tmp / "%(id)s.%(ext)s")}
     if is_youtube:
         if shutil.which("ffmpeg"):
             opts["format"] = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
@@ -228,6 +302,7 @@ def run_job():
     if not JOB_LOCK.acquire(blocking=False):
         return
     STATE["running"] = True
+    STATE["need_cookies"] = False
     try:
         s = load_settings()
         log("Run started.")
@@ -254,8 +329,14 @@ def run_job():
             tt = [dict(e, _src="tiktok") for e in list_tiktoks(handle) if e.get("id") not in done]
             log(f"Found {len(tt)} new TikTok(s) for @{handle}.")
         if use_yt:
-            yt = [dict(e, _src="youtube") for e in list_youtube(s["yt_channel"], s["yt_content"])
-                  if e.get("id") not in done]
+            try:
+                yt = [dict(e, _src="youtube") for e in list_youtube(s["yt_channel"], s["yt_content"])
+                      if e.get("id") not in done]
+            except NeedSignIn as e:
+                STATE["need_cookies"] = True
+                log(need_signin_message(clean_err(e)))
+                if not use_tt:
+                    return
             log(f"Found {len(yt)} new video(s) on the old YouTube channel ({s['yt_content']}).")
 
         if use_tt and use_yt:
@@ -269,8 +350,8 @@ def run_job():
         log(f"Posting up to {s['limit']} ({s['order']} first).")
         for entry in entries[: int(s["limit"])]:
             url = entry.get("url") or entry.get("webpage_url")
+            is_yt = entry["_src"] == "youtube"
             try:
-                is_yt = entry["_src"] == "youtube"
                 path, info = download(url, is_youtube=is_yt)
                 desc = info.get("description") or info.get("title") or ""
                 title = (info.get("title") or "") if is_yt else desc.split("\n")[0]
@@ -280,10 +361,15 @@ def run_job():
                 path.unlink(missing_ok=True)
                 log(f"Posted: {link}")
             except Exception as e:
-                log(f"Skipped {url}: {e}")
+                msg = clean_err(e)
+                if is_yt and is_auth_error(msg):
+                    STATE["need_cookies"] = True
+                    log(need_signin_message(msg))
+                    break  # every other YouTube download would fail the same way
+                log(f"Skipped {url}: {msg}")
         log("Run finished.")
     except Exception as e:
-        log(f"Error: {e}")
+        log(f"Error: {clean_err(e)}")
     finally:
         STATE["running"] = False
         STATE["last"] = time.strftime("%Y-%m-%d %H:%M")
@@ -309,18 +395,21 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 main{max-width:640px;margin:0 auto;padding:20px}h1{font-size:20px;margin:0 0 16px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
 label{display:block;font-size:13px;color:var(--mut);margin:10px 0 4px}
-input,select{width:100%;padding:9px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+input,select,textarea{width:100%;padding:9px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+textarea{font:12px ui-monospace,monospace;resize:vertical}
 .row{display:flex;gap:10px}.row>*{flex:1}
 button,.btn{display:inline-block;padding:9px 14px;border:0;border-radius:8px;background:var(--ac);color:#fff;font:inherit;cursor:pointer;text-decoration:none}
 button.sec{background:transparent;color:var(--fg);border:1px solid var(--bd)}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
 pre{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px;height:220px;overflow:auto;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
 a{color:var(--ac)}.mut{color:var(--mut);font-size:13px}.chk{display:flex;align-items:center;gap:8px;margin-top:12px}.chk input{width:auto}
+.alert{border-color:var(--ac)}
 </style></head><body><main>
 <h1>Video Reposter</h1>
 %%WARN%%
 <div class="card"><b>New YouTube channel (where videos get posted)</b><br><span class="dot" style="background:%%YTCOLOR%%"></span>%%YTTEXT%%
-<div style="margin-top:10px">%%YTBTN%%</div></div>
+<div style="margin-top:10px">%%YTBTN%%</div>
+<div class="mut" style="margin-top:8px">Click the button, sign in with Google and accept, and videos will post to that channel.</div></div>
 <form class="card" method="post" action="/save"><b>Settings</b>
 <label>Take videos from</label><select name="source" id="source">%%SRC%%</select>
 <div id="tt-box"><label>TikTok handle (no @)</label><input name="handle" value="%%HANDLE%%" placeholder="yourname"></div>
@@ -337,6 +426,11 @@ a{color:var(--ac)}.mut{color:var(--mut);font-size:13px}.chk{display:flex;align-i
 <span class="mut" id="st" style="text-align:right">%%STATUS%%</span></div>
 <form method="post" action="/run" style="margin:10px 0 0"><button type="submit">Run now</button></form>
 <pre id="log">%%LOG%%</pre></div>
+<div class="card"><b>YouTube cookies</b> <span class="mut">(%%CKSTATUS%%)</span>
+<div class="mut" style="margin-top:6px">Only needed if YouTube blocks the old channel. While signed in to YouTube in your browser, export cookies.txt (for example with the "Get cookies.txt LOCALLY" extension) and paste it here.</div>
+<form method="post" action="/cookies"><textarea name="cookies" rows="5" placeholder="# Netscape HTTP Cookie File"></textarea>
+<div style="margin-top:10px"><button type="submit">Save cookies and retry</button></div></form>
+<form method="post" action="/cookies_clear" style="margin-top:8px"><button class="sec" type="submit">Delete saved cookies</button></form></div>
 <div class="card"><b>Posted (%%COUNT%%)</b><div class="mut" style="margin-top:6px">%%HIST%%</div>
 <form method="post" action="/reset" onsubmit="return confirm('Forget what was posted? Old videos may be posted again.')" style="margin-top:10px">
 <button class="sec" type="submit">Reset history</button></form></div>
@@ -376,7 +470,10 @@ def dashboard():
         yt_ok = bool(find_youtube(cached=True))
         yt_text = "Connected" if yt_ok else "Not connected"
     except Exception as e:
-        warn = f'<div class="card" style="border-color:var(--ac)">{html.escape(str(e))}</div>'
+        warn += f'<div class="card alert">{html.escape(str(e))}</div>'
+    if STATE["need_cookies"]:
+        warn += ('<div class="card alert"><b>YouTube needs you to sign in.</b> Paste your cookies in the '
+                 '"YouTube cookies" box below and the bot will retry automatically.</div>')
     btn = '<a class="btn" href="/connect">%s YouTube</a>' % ("Reconnect" if yt_ok else "Connect")
     hist = load_history()
     h_html = "<br>".join(
@@ -397,6 +494,7 @@ def dashboard():
         "PRIV": options(PRIVACY, s["privacy"]), "LIMIT": str(s["limit"]),
         "AUTO": "checked" if s["auto"] else "", "INT": str(s["interval"]), "STATUS": html.escape(status_text()),
         "LOG": html.escape("\n".join(LOG)), "COUNT": str(len(hist)), "HIST": h_html,
+        "CKSTATUS": html.escape(cookie_status()),
     }
     out = PAGE
     for k, v in rep.items():
@@ -464,8 +562,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.headers.get("Sec-Fetch-Site") == "cross-site":
             return self.send(403, "Blocked")
-        n = int(self.headers.get("Content-Length") or 0)
-        form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+        n = min(int(self.headers.get("Content-Length") or 0), 3_000_000)
+        form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode(errors="replace")).items()}
         path = urlparse(self.path).path
         if path == "/save":
             s = load_settings()
@@ -484,6 +582,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/run":
             if not STATE["running"]:
                 threading.Thread(target=run_job, daemon=True).start()
+        elif path == "/cookies":
+            if save_cookies(form.get("cookies", "")) and not STATE["running"]:
+                log("Retrying with the new cookies...")
+                threading.Thread(target=run_job, daemon=True).start()
+        elif path == "/cookies_clear":
+            COOKIES_F.unlink(missing_ok=True)
+            log("Saved cookies deleted.")
         elif path == "/reset":
             HISTORY_F.write_text("[]")
             log("History reset.")
