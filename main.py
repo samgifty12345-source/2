@@ -197,13 +197,16 @@ def list_youtube(channel, content):
     import yt_dlp
     base = channel_base(channel)
     tabs = ["streams", "videos"] if content == "both" else [content]
+    urls = [f"{base}/{t}" for t in tabs]
+    m = re.search(r"/channel/(UC[\w-]{22})", base)
+    if m:  # uploads playlist: includes past streams, sometimes works when the tabs do not
+        urls.append("https://www.youtube.com/playlist?list=UU" + m.group(1)[2:])
     seen, out, errors = set(), [], []
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist"}
     ck = cookie_file()
     if ck:
         opts["cookiefile"] = ck
-    for tab in tabs:
-        url = f"{base}/{tab}"
+    for url in urls:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -608,5 +611,10 @@ if __name__ == "__main__":
         STATE["next"] = time.time() + 60
     threading.Thread(target=scheduler, daemon=True).start()
     port = int(os.getenv("PORT", "8080"))
+    try:
+        import yt_dlp
+        log(f"yt-dlp version {yt_dlp.version.__version__}")
+    except Exception as e:
+        log(f"yt-dlp is not installed: {e}")
     log(f"Dashboard running on port {port}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
